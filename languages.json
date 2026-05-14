@@ -1,0 +1,112 @@
+{
+    "detection": [
+        {
+            "marker": "go.mod",
+            "language": "go",
+            "label": "Go",
+            "icon": "🔵"
+        },
+        {
+            "marker": "composer.json",
+            "language": "php",
+            "label": "PHP",
+            "icon": "🐘"
+        },
+        {
+            "marker": "package.json",
+            "language": "typescript",
+            "label": "TypeScript / JavaScript",
+            "icon": "🔷"
+        },
+        {
+            "marker": "Cargo.toml",
+            "language": "rust",
+            "label": "Rust",
+            "icon": "🦀"
+        },
+        {
+            "marker": "pyproject.toml",
+            "language": "python",
+            "label": "Python",
+            "icon": "🐍"
+        },
+        {
+            "marker": "requirements.txt",
+            "language": "python",
+            "label": "Python",
+            "icon": "🐍"
+        },
+        {
+            "marker": "Gemfile",
+            "language": "ruby",
+            "label": "Ruby",
+            "icon": "💎"
+        }
+    ],
+    "servers": {
+        "go": {
+            "command": [
+                "gopls"
+            ],
+            "args": [],
+            "env": {},
+            "install_check": "which gopls",
+            "install_hint": "go install golang.org/x/tools/gopls@latest"
+        },
+        "php": {
+            "command": [
+                "phpactor",
+                "language-server"
+            ],
+            "args": [],
+            "env": {},
+            "install_check": "which phpactor",
+            "install_hint": "composer global require phpactor/phpactor"
+        },
+        "typescript": {
+            "command": [
+                "typescript-language-server",
+                "--stdio"
+            ],
+            "args": [],
+            "env": {},
+            "install_check": "which typescript-language-server",
+            "install_hint": "npm install -g typescript-language-server typescript"
+        },
+        "rust": {
+            "command": [
+                "rust-analyzer"
+            ],
+            "args": [],
+            "env": {},
+            "install_check": "which rust-analyzer",
+            "install_hint": "rustup component add rust-analyzer"
+        },
+        "python": {
+            "command": [
+                "pyright-langserver",
+                "--stdio"
+            ],
+            "args": [],
+            "env": {},
+            "install_check": "which pyright-langserver || pip3 show pyright 2>/dev/null",
+            "install_hint": "pip3 install pyright"
+        },
+        "ruby": {
+            "command": [
+                "solargraph",
+                "stdio"
+            ],
+            "args": [],
+            "env": {},
+            "install_check": "which solargraph",
+            "install_hint": "gem install solargraph"
+        }
+    },
+    "settings": {
+        "max_results": 20,
+        "request_timeout_ms": 10000,
+        "pid_file": "/tmp/lsp-server.pid",
+        "log_file": "/tmp/lsp-server.log"
+    }
+}
