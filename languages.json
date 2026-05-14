@@ -55,7 +55,9 @@
         },
         "php": {
             "command": [
-                "intelephense",
+                "node",
+                "--max-old-space-size=512",
+                "/usr/local/bin/intelephense",
                 "--stdio"
             ],
             "args": [],

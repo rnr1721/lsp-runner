@@ -129,6 +129,30 @@ Edit `languages.json` to add new languages or change server settings:
 }
 ```
 
+### Custom configuration
+
+To override server settings without modifying the default `languages.json`,
+create a `languages_custom.json` file in the same directory:
+
+```json
+{
+  "servers": {
+    "php": {
+      "command": ["phpactor", "language-server"],
+      "install_check": "which phpactor",
+      "install_hint": "composer global require phpactor/phpactor"
+    }
+  },
+  "settings": {
+    "max_results": 30,
+    "pid_file": "/tmp/my-lsp.pid"
+  }
+}
+```
+
+`languages_custom.json` is merged with `languages.json` at runtime.
+Custom values override defaults. The file is gitignored — safe for local changes.
+
 ## Requirements
 
 - Python 3.7+
