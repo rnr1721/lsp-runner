@@ -68,11 +68,23 @@ def load_config():
 
 
 def detect_language(config):
-    """Auto-detect project language by marker files in home directory."""
+    """Auto-detect project language by marker files in home directory (with deep scan)."""
+    # 1. Check home directory directly
     for entry in config.get("detection", []):
         marker = os.path.join(HOME, entry["marker"])
         if os.path.exists(marker):
             return entry
+
+    # 2. Deep scan: search up to 3 levels deep from HOME
+    for root, dirs, files in os.walk(HOME):
+        depth = root[len(HOME) :].count(os.sep)
+        if depth > 3:
+            dirs.clear()
+            continue
+        for entry in config.get("detection", []):
+            if entry["marker"] in files:
+                return entry
+
     return None
 
 
