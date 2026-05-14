@@ -37,12 +37,34 @@ _request_counter = itertools.count(1)
 
 
 def load_config():
-    """Load languages.json configuration."""
-    if not os.path.exists(CONFIG_PATH):
-        print(json.dumps({"error": f"Configuration file not found: {CONFIG_PATH}"}))
+    """Load languages.json, merged with languages_custom.json if exists."""
+    base_path = os.environ.get("LSP_RUNNER_CONFIG", str(SCRIPT_DIR / "languages.json"))
+    custom_path = os.path.join(os.path.dirname(base_path), "languages_custom.json")
+
+    if not os.path.exists(base_path):
+        print(json.dumps({"error": f"Configuration file not found: {base_path}"}))
         sys.exit(1)
-    with open(CONFIG_PATH) as f:
-        return json.load(f)
+
+    with open(base_path) as f:
+        config = json.load(f)
+
+    if os.path.exists(custom_path):
+        with open(custom_path) as f:
+            custom = json.load(f)
+
+        if "detection" in custom:
+            existing = {e["language"]: e for e in config.get("detection", [])}
+            for entry in custom["detection"]:
+                existing[entry["language"]] = entry
+            config["detection"] = list(existing.values())
+
+        if "servers" in custom:
+            config.setdefault("servers", {}).update(custom["servers"])
+
+        if "settings" in custom:
+            config.setdefault("settings", {}).update(custom["settings"])
+
+    return config
 
 
 def detect_language(config):
