@@ -55,13 +55,13 @@
         },
         "php": {
             "command": [
-                "phpactor",
-                "language-server"
+                "intelephense",
+                "--stdio"
             ],
             "args": [],
             "env": {},
-            "install_check": "which phpactor",
-            "install_hint": "composer global require phpactor/phpactor"
+            "install_check": "which intelephense",
+            "install_hint": "npm install -g intelephense"
         },
         "typescript": {
             "command": [
