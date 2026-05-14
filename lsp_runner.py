@@ -477,6 +477,12 @@ class LSPBroker:
         self._diagnostics = {}
         self._diagnostics_lock = threading.Lock()
 
+        # Track files we've already announced to the server via didOpen.
+        # Stateful LSP servers (intelephense, pyright) refuse to answer
+        # requests about documents they don't consider "open".
+        self._open_docs = set()
+        self._open_docs_lock = threading.Lock()
+
     def _create_socket(self):
         if os.path.exists(SOCKET_PATH):
             try:
@@ -513,103 +519,174 @@ class LSPBroker:
         self.stop()
 
     def _handle_client(self, conn):
-        request = None
-        client_id = None
-        internal_id = None
+        """Serve one client connection.
 
-        try:
-            request = self._read_socket_message(conn, timeout=5)
+        Reads JSON-RPC requests in a loop until the client closes the
+        socket. Each request is dispatched in its own worker thread so
+        pipelined requests on the same connection don't block each other.
+        A write-lock serializes responses on the wire — otherwise two
+        workers could interleave bytes of separate responses.
+        """
+        write_lock = threading.Lock()
+        inflight = []  # worker threads we spawned, for clean shutdown
+
+        def send_response(response):
+            try:
+                with write_lock:
+                    conn.sendall(encode_jsonrpc_message(response))
+            except (OSError, BrokenPipeError):
+                pass  # Client went away; nothing we can do.
+
+        def serve_one(request):
             client_id = request.get("id")
             method = request.get("method", "")
-
-            # --- Broker-local methods (not forwarded to LSP server) ---
-            if method == "shutdown":
-                self.running = False
-                response = {
-                    "jsonrpc": "2.0",
-                    "id": client_id,
-                    "result": None,
-                }
-                conn.sendall(encode_jsonrpc_message(response))
-                return
-
-            if method == "diagnostics/get":
-                params = request.get("params") or {}
-                uri = params.get("uri")
-                response = {
-                    "jsonrpc": "2.0",
-                    "id": client_id,
-                    "result": self.get_diagnostics(uri),
-                }
-                conn.sendall(encode_jsonrpc_message(response))
-                return
-
-            # --- Forwarded LSP requests: remap ID to avoid collisions ---
-            internal_id = next(_request_counter)
-            forwarded = dict(request)
-            forwarded["id"] = internal_id
-
-            response_queue = self.dispatcher.send_request(forwarded, self.proc)
+            internal_id = None
 
             try:
-                timeout = (
-                    self.config.get("settings", {}).get("request_timeout_ms", 10000)
-                    / 1000
+                # --- Broker-local methods (not forwarded to LSP server) ---
+                if method == "shutdown":
+                    self.running = False
+                    send_response(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": client_id,
+                            "result": None,
+                        }
+                    )
+                    return
+
+                if method == "diagnostics/get":
+                    params = request.get("params") or {}
+                    uri = params.get("uri")
+                    send_response(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": client_id,
+                            "result": self.get_diagnostics(uri),
+                        }
+                    )
+                    return
+
+                # --- Forwarded LSP requests: remap ID ---
+                internal_id = next(_request_counter)
+                forwarded = dict(request)
+                forwarded["id"] = internal_id
+
+                # For file-targeted requests, make sure the server knows
+                # about the document. Stateful servers (intelephense,
+                # pyright) return empty results for unopened files.
+                params = forwarded.get("params") or {}
+                td = params.get("textDocument") or {}
+                uri = td.get("uri", "")
+                if uri.startswith("file://"):
+                    self.ensure_doc_open(uri[len("file://") :])
+
+                response_queue = self.dispatcher.send_request(forwarded, self.proc)
+
+                try:
+                    timeout = (
+                        self.config.get("settings", {}).get("request_timeout_ms", 10000)
+                        / 1000
+                    )
+                    response = response_queue.get(timeout=timeout)
+                    response["id"] = client_id  # restore client's ID
+                    send_response(response)
+                except queue.Empty:
+                    self.dispatcher.cancel(internal_id)
+                    send_response(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": client_id,
+                            "error": {"code": -1, "message": "Request timeout"},
+                        }
+                    )
+            except Exception as e:
+                if internal_id is not None:
+                    self.dispatcher.cancel(internal_id)
+                send_response(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": client_id,
+                        "error": {"code": -1, "message": str(e)},
+                    }
                 )
-                response = response_queue.get(timeout=timeout)
-                response["id"] = client_id  # restore client's ID
-                conn.sendall(encode_jsonrpc_message(response))
-            except queue.Empty:
-                self.dispatcher.cancel(internal_id)
-                error_response = {
-                    "jsonrpc": "2.0",
-                    "id": client_id,
-                    "error": {"code": -1, "message": "Request timeout"},
-                }
-                conn.sendall(encode_jsonrpc_message(error_response))
 
-        except Exception as e:
-            if internal_id is not None:
-                self.dispatcher.cancel(internal_id)
-            try:
-                error_response = {
-                    "jsonrpc": "2.0",
-                    "error": {"code": -1, "message": str(e)},
-                    "id": client_id,
-                }
-                conn.sendall(encode_jsonrpc_message(error_response))
-            except Exception:
-                pass
+        try:
+            # Persistent loop: keep reading messages until client closes.
+            reader_buf = bytearray()
+            # Long-ish per-request timeout; the loop itself is bounded by
+            # the client closing the socket.
+            conn.settimeout(60)
+
+            while self.running:
+                request = self._read_one_from_buffer(conn, reader_buf)
+                if request is None:
+                    break  # client closed cleanly
+
+                worker = threading.Thread(
+                    target=serve_one, args=(request,), daemon=True
+                )
+                worker.start()
+                inflight.append(worker)
+
+                # Reap finished workers to keep the list bounded.
+                inflight[:] = [t for t in inflight if t.is_alive()]
+        except (socket.timeout, OSError):
+            pass
+        except Exception:
+            pass
         finally:
+            # Don't close the socket until in-flight workers have written
+            # their responses, otherwise their sendall() will EPIPE.
+            for t in inflight:
+                t.join(timeout=5)
             try:
                 conn.close()
             except Exception:
                 pass
 
-    def _read_socket_message(self, conn, timeout):
-        conn.settimeout(timeout)
-        data = b""
+    def _read_one_from_buffer(self, conn, buf):
+        """Read exactly one JSON-RPC message from `conn`, using `buf` as
+        the carry-over buffer between calls.
 
+        Returns the parsed message, or None if the client closed the
+        connection cleanly (EOF before any new bytes).
+        """
         while True:
-            chunk = conn.recv(4096)
-            if not chunk:
-                break
-            data += chunk
-
-            if b"\r\n\r\n" in data:
-                header_end = data.index(b"\r\n\r\n")
-                header_str = data[:header_end].decode("utf-8", errors="replace")
+            # Try to parse from what we already have.
+            if b"\r\n\r\n" in buf:
+                header_end = buf.index(b"\r\n\r\n")
+                header_str = bytes(buf[:header_end]).decode("utf-8", errors="replace")
                 match = re.search(r"Content-Length:\s*(\d+)", header_str, re.IGNORECASE)
-
-                if match:
-                    content_length = int(match.group(1))
-                    body_start = header_end + 4
-
-                    if len(data) >= body_start + content_length:
-                        body = data[body_start : body_start + content_length]
+                if not match:
+                    # Bad header — drop it and try to recover.
+                    del buf[: header_end + 4]
+                    continue
+                content_length = int(match.group(1))
+                body_start = header_end + 4
+                total_needed = body_start + content_length
+                if len(buf) >= total_needed:
+                    body = bytes(buf[body_start:total_needed])
+                    del buf[:total_needed]
+                    try:
                         return json.loads(body.decode("utf-8"))
+                    except json.JSONDecodeError as e:
+                        raise RuntimeError(f"Malformed JSON body: {e}")
 
-        raise RuntimeError("Incomplete message")
+            # Need more bytes.
+            try:
+                chunk = conn.recv(4096)
+            except socket.timeout:
+                # Idle keep-alive timeout. Tell caller to give up on
+                # this connection.
+                return None
+            if not chunk:
+                # EOF. If we have a partial frame, that's a protocol
+                # error; if buf is empty, it's a clean close.
+                if buf:
+                    raise RuntimeError("Connection closed mid-message")
+                return None
+            buf.extend(chunk)
 
     def _handle_diagnostics(self, params):
         uri = params.get("uri", "")
@@ -618,6 +695,112 @@ class LSPBroker:
 
     def _handle_progress(self, params):
         pass
+
+    # ── didOpen tracking ──────────────────────────────────────────────
+
+    # Per-language IDs the LSP spec recognises. The runner's detected
+    # language name (from languages.json) maps to one of these.
+    _LSP_LANGUAGE_IDS = {
+        "python": "python",
+        "php": "php",
+        "javascript": "javascript",
+        "typescript": "typescript",
+        "go": "go",
+        "rust": "rust",
+        "ruby": "ruby",
+        "java": "java",
+        "c": "c",
+        "cpp": "cpp",
+        "csharp": "csharp",
+        # extend as needed; languages.json can also override via
+        # `lsp_language_id` on the server entry.
+    }
+
+    def _lsp_language_id_for(self, file_path):
+        """Pick the languageId for didOpen. Order of preference:
+        1. Server entry override (`lsp_language_id` in languages.json).
+        2. File extension mapping.
+        3. The detected project language.
+        """
+        servers = self.config.get("servers", {})
+        # The runner only manages one server, but we don't know its name
+        # here without a back-reference; fall through to extension.
+        ext_map = {
+            ".py": "python",
+            ".php": "php",
+            ".js": "javascript",
+            ".jsx": "javascriptreact",
+            ".ts": "typescript",
+            ".tsx": "typescriptreact",
+            ".go": "go",
+            ".rs": "rust",
+            ".rb": "ruby",
+            ".java": "java",
+            ".c": "c",
+            ".h": "c",
+            ".cpp": "cpp",
+            ".cc": "cpp",
+            ".hpp": "cpp",
+            ".cs": "csharp",
+        }
+        _, ext = os.path.splitext(file_path)
+        if ext in ext_map:
+            return ext_map[ext]
+        # Fallback: whatever the project language is.
+        return get_running_language(self.config)
+
+    def ensure_doc_open(self, file_path):
+        """Send textDocument/didOpen for `file_path` if we haven't already.
+
+        Reads the file from disk so the server's view of it matches what's
+        actually there. No-op if the file doesn't exist or has already
+        been opened in this session.
+        """
+        if not file_path or not os.path.isfile(file_path):
+            return
+
+        uri = f"file://{file_path}"
+        with self._open_docs_lock:
+            if uri in self._open_docs:
+                return
+            # Mark before sending so concurrent requests don't double-open.
+            self._open_docs.add(uri)
+
+        try:
+            with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+                text = f.read()
+        except OSError:
+            # Couldn't read — undo the mark so a later retry can try again.
+            with self._open_docs_lock:
+                self._open_docs.discard(uri)
+            return
+
+        language_id = self._lsp_language_id_for(file_path)
+        notification = {
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": language_id,
+                    "version": 1,
+                    "text": text,
+                }
+            },
+        }
+        try:
+            send_jsonrpc_to_proc(self.proc, notification)
+        except (OSError, BrokenPipeError):
+            with self._open_docs_lock:
+                self._open_docs.discard(uri)
+            return
+
+        # Some servers (pyright, intelephense) need a brief moment to
+        # parse/index the just-opened document before they can answer
+        # queries about it. Configurable per-server via languages.json.
+        delay_ms = self.config.get("settings", {}).get("post_open_delay_ms", 0)
+        if delay_ms > 0:
+            time.sleep(delay_ms / 1000)
 
     def get_diagnostics(self, uri=None):
         """Retrieve stored diagnostics.
@@ -666,22 +849,45 @@ def start_lsp_process(server, config):
     )
 
     reader = LSPStdoutReader(proc.stdout)
+    workspace_uri = f"file://{HOME}"
     init_request = {
         "jsonrpc": "2.0",
         "id": next(_request_counter),
         "method": "initialize",
         "params": {
             "processId": proc.pid,
-            "rootUri": f"file://{HOME}",
+            "clientInfo": {"name": "depthnet-lsp-runner", "version": "2.1"},
+            "rootUri": workspace_uri,
+            "rootPath": HOME,
+            "workspaceFolders": [
+                {"uri": workspace_uri, "name": os.path.basename(HOME) or "home"}
+            ],
             "capabilities": {
                 "textDocument": {
-                    "references": {},
-                    "definition": {},
-                    "hover": {},
-                    "documentSymbol": {},
-                    "publishDiagnostics": {},
-                }
+                    "synchronization": {
+                        "didSave": True,
+                        "willSave": False,
+                        "dynamicRegistration": False,
+                    },
+                    "references": {"dynamicRegistration": False},
+                    "definition": {"dynamicRegistration": False},
+                    "hover": {
+                        "dynamicRegistration": False,
+                        "contentFormat": ["markdown", "plaintext"],
+                    },
+                    "documentSymbol": {
+                        "dynamicRegistration": False,
+                        "hierarchicalDocumentSymbolSupport": False,
+                    },
+                    "publishDiagnostics": {"relatedInformation": False},
+                },
+                "workspace": {
+                    "workspaceFolders": True,
+                    "configuration": False,
+                },
             },
+            # Some servers (intelephense) read this for licensing/feature flags.
+            "initializationOptions": server.get("initialization_options", {}),
         },
     }
 
@@ -819,18 +1025,43 @@ def parse_lsp_response(method, response, max_results):
             text = str(contents)
         return {"hover": text[:1000]}
     elif method == "symbols":
-        symbols = result if isinstance(result, list) else []
-        return {
-            "results": [
-                {
-                    "file": "",
-                    "line": s.get("range", {}).get("start", {}).get("line", 0) + 1,
-                    "col": s.get("range", {}).get("start", {}).get("character", 0) + 1,
-                    "context": s.get("name", ""),
-                }
-                for s in symbols[:max_results]
-            ]
-        }
+        out = []
+
+        def flatten(items):
+            for s in items:
+                rng = s.get("selectionRange") or s.get("range") or {}
+                start = rng.get("start", {})
+                out.append(
+                    {
+                        "file": "",
+                        "line": start.get("line", 0) + 1,
+                        "col": start.get("character", 0) + 1,
+                        "context": s.get("name", ""),
+                        "kind": s.get("kind", 0),
+                    }
+                )
+                children = s.get("children") or []
+                flatten(children)
+
+        if isinstance(result, list):
+            if result and "selectionRange" in result[0]:
+                flatten(result)
+            else:
+                for s in result:
+                    loc = s.get("location", {})
+                    rng = loc.get("range", {})
+                    start = rng.get("start", {})
+                    out.append(
+                        {
+                            "file": loc.get("uri", "").replace("file://", ""),
+                            "line": start.get("line", 0) + 1,
+                            "col": start.get("character", 0) + 1,
+                            "context": s.get("name", ""),
+                            "kind": s.get("kind", 0),
+                        }
+                    )
+
+        return {"results": out[:max_results]}
     elif method == "diagnostics":
         # Either a list (uri given) or a dict {uri: [diags]} (no uri).
         if isinstance(result, list):
@@ -878,24 +1109,36 @@ def _daemonize(log_file_path):
 
     try:
         pid = os.fork()
-    except OSError as e:
+    except OSError:
         os._exit(1)
 
     if pid > 0:
         # Intermediate child exits; the grandchild becomes the daemon.
         os._exit(0)
 
-    # Daemon. Redirect stdio so we don't keep the terminal open.
+    # We're the daemon now. Redirect stdio BEFORE doing anything that
+    # might fail — so any error trace ends up in the log file.
     os.chdir("/")
-    sys.stdout.flush()
-    sys.stderr.flush()
 
-    with open(os.devnull, "rb") as devnull_in:
-        os.dup2(devnull_in.fileno(), sys.stdin.fileno())
-    with open(log_file_path, "a") as log_out:
-        os.dup2(log_out.fileno(), sys.stdout.fileno())
-        os.dup2(log_out.fileno(), sys.stderr.fileno())
+    # Open log first; if it fails, we have no choice but to die silently.
+    try:
+        log_fd = os.open(log_file_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    except OSError:
+        os._exit(2)
 
+    # Redirect stdin to /dev/null, stdout+stderr to the log.
+    try:
+        devnull_fd = os.open(os.devnull, os.O_RDONLY)
+        os.dup2(devnull_fd, 0)
+        os.close(devnull_fd)
+        os.dup2(log_fd, 1)
+        os.dup2(log_fd, 2)
+        os.close(log_fd)
+    except OSError:
+        os._exit(3)
+
+    # Now any uncaught exception in the daemon will write its traceback
+    # to the log file via sys.stderr (= fd 2 = the log).
     return True
 
 
@@ -1108,6 +1351,93 @@ def cmd_language(config):
         print(detected["language"] if detected else "unknown")
 
 
+def _validate_and_build(request, config):
+    """Validate a client request dict and build the corresponding LSP request.
+
+    Returns (lsp_request, method, max_results) on success,
+    or ({"error": "..."}, None, None) on validation failure.
+    """
+    method = request.get("method", "")
+    file_path = request.get("file", "")
+    line = request.get("line", 1)
+    character = request.get("character", request.get("col", request.get("char", 1)))
+
+    if not isinstance(line, int) or line < 1:
+        return (
+            {"error": f"`line` must be a positive integer, got: {line!r}"},
+            None,
+            None,
+        )
+    if not isinstance(character, int) or character < 1:
+        return (
+            {"error": f"`character` must be a positive integer, got: {character!r}"},
+            None,
+            None,
+        )
+
+    symbol = request.get("symbol", "")
+    max_results = request.get(
+        "max_results", config.get("settings", {}).get("max_results", 20)
+    )
+    language_id = get_running_language(config)
+
+    lsp_request = build_lsp_request(
+        method, file_path, symbol, line, character, language_id
+    )
+    if lsp_request is None:
+        return {"error": f"Unsupported method: {method}"}, None, None
+
+    return lsp_request, method, max_results
+
+
+def _drain_one_response(sock, expected_id, deadline):
+    """Read frames from `sock` until one with id == expected_id arrives.
+
+    Returns the parsed message, or None on timeout.
+    """
+    buffer = b""
+
+    while time.time() < deadline:
+        remaining = deadline - time.time()
+        ready, _, _ = select.select([sock], [], [], min(0.1, remaining))
+        if not ready:
+            continue
+
+        chunk = sock.recv(4096)
+        if not chunk:
+            return None
+
+        buffer += chunk
+
+        while b"\r\n\r\n" in buffer:
+            header_end = buffer.index(b"\r\n\r\n")
+            header_str = buffer[:header_end].decode("utf-8", errors="replace")
+            match = re.search(r"Content-Length:\s*(\d+)", header_str, re.IGNORECASE)
+            if not match:
+                buffer = buffer[header_end + 4 :]
+                continue
+
+            content_length = int(match.group(1))
+            body_start = header_end + 4
+            total_needed = body_start + content_length
+
+            if len(buffer) < total_needed:
+                break
+
+            body_bytes = buffer[body_start:total_needed]
+            buffer = buffer[total_needed:]
+
+            try:
+                msg = json.loads(body_bytes.decode("utf-8", errors="replace"))
+            except json.JSONDecodeError:
+                continue
+
+            if msg.get("id") == expected_id:
+                return msg
+
+    return None
+
+
 def cmd_request(config):
     if not is_running(config):
         print(
@@ -1125,79 +1455,128 @@ def cmd_request(config):
         print(json.dumps({"error": f"Invalid JSON: {e}"}))
         return
 
-    method = request.get("method", "")
-    file_path = request.get("file", "")
-    line = request.get("line", 1)
-    character = request.get("character", request.get("col", request.get("char", 1)))
-
-    # Input validation.
-    if not isinstance(line, int) or line < 1:
-        print(
-            json.dumps({"error": f"`line` must be a positive integer, got: {line!r}"})
-        )
+    lsp_request, method, max_results = _validate_and_build(request, config)
+    if method is None:
+        print(json.dumps(lsp_request, ensure_ascii=False))
         return
-    if not isinstance(character, int) or character < 1:
+
+    timeout = config.get("settings", {}).get("request_timeout_ms", 10000) / 1000
+
+    sock = None
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        sock.connect(SOCKET_PATH)
+        sock.sendall(encode_jsonrpc_message(lsp_request))
+
+        response = _drain_one_response(sock, lsp_request["id"], time.time() + timeout)
+        if response is None:
+            result = {"error": "Timeout waiting for LSP response"}
+        else:
+            result = parse_lsp_response(method, response, max_results)
+    except Exception as e:
+        result = {"error": f"LSP request failed: {e}"}
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    print(json.dumps(result, ensure_ascii=False))
+
+
+def cmd_batch(config):
+    """Run multiple requests over a single connection.
+
+    Input on stdin: a JSON array of request objects (same format as
+    `request`). Output: a JSON array of result objects, in the same
+    order. Requests are pipelined on one socket — the broker spawns a
+    worker per request, so they execute concurrently on the LSP side.
+    """
+    if not is_running(config):
         print(
             json.dumps(
-                {"error": f"`character` must be a positive integer, got: {character!r}"}
+                {
+                    "error": "LSP server is not running. Start it with 'lsp-runner start'."
+                }
             )
         )
         return
 
-    symbol = request.get("symbol", "")
-    max_results = request.get(
-        "max_results", config.get("settings", {}).get("max_results", 20)
-    )
-    language_id = get_running_language(config)
-
-    lsp_request = build_lsp_request(
-        method, file_path, symbol, line, character, language_id
-    )
-    if lsp_request is None:
-        print(json.dumps({"error": f"Unsupported method: {method}"}))
+    try:
+        requests = json.loads(sys.stdin.read())
+    except json.JSONDecodeError as e:
+        print(json.dumps({"error": f"Invalid JSON: {e}"}))
         return
+
+    if not isinstance(requests, list):
+        print(
+            json.dumps(
+                {"error": "Batch input must be a JSON array of request objects."}
+            )
+        )
+        return
+
+    timeout = config.get("settings", {}).get("request_timeout_ms", 10000) / 1000
+
+    # Build all requests up front; bail with per-slot errors for invalid ones.
+    built = []
+    for i, req in enumerate(requests):
+        if not isinstance(req, dict):
+            built.append(
+                (None, None, None, {"error": f"Request #{i} is not an object"})
+            )
+            continue
+        lsp_request, method, max_results = _validate_and_build(req, config)
+        if method is None:
+            built.append((None, None, None, lsp_request))  # validation error dict
+        else:
+            built.append((lsp_request, method, max_results, None))
+
+    # Open one socket, send all valid requests, then collect responses.
+    sock = None
+    results = [None] * len(built)
+    pending_ids = {}  # lsp_id -> slot_index
 
     try:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        timeout = config.get("settings", {}).get("request_timeout_ms", 10000) / 1000
         sock.settimeout(timeout)
         sock.connect(SOCKET_PATH)
 
-        sock.sendall(encode_jsonrpc_message(lsp_request))
-        # Half-close write side so the broker sees EOF if it ever needs to.
-        try:
-            sock.shutdown(socket.SHUT_WR)
-        except OSError:
-            pass
+        for idx, (lsp_request, _method, _max_results, err) in enumerate(built):
+            if err is not None:
+                results[idx] = err
+                continue
+            sock.sendall(encode_jsonrpc_message(lsp_request))
+            pending_ids[lsp_request["id"]] = idx
 
+        # Per-request budget, summed but capped — pipelining means we
+        # don't really pay N×timeout, but we want a sane upper bound.
+        deadline = time.time() + timeout * max(1, len(pending_ids))
         buffer = b""
-        deadline = time.time() + timeout
 
-        while time.time() < deadline:
+        while pending_ids and time.time() < deadline:
             remaining = deadline - time.time()
-            ready, _, _ = select.select([sock], [], [], min(0.1, remaining))
+            ready, _, _ = select.select([sock], [], [], min(0.2, remaining))
             if not ready:
                 continue
 
             chunk = sock.recv(4096)
             if not chunk:
                 break
-
             buffer += chunk
 
             while b"\r\n\r\n" in buffer:
                 header_end = buffer.index(b"\r\n\r\n")
                 header_str = buffer[:header_end].decode("utf-8", errors="replace")
                 match = re.search(r"Content-Length:\s*(\d+)", header_str, re.IGNORECASE)
-
                 if not match:
                     buffer = buffer[header_end + 4 :]
                     continue
-
                 content_length = int(match.group(1))
                 body_start = header_end + 4
                 total_needed = body_start + content_length
-
                 if len(buffer) < total_needed:
                     break
 
@@ -1209,33 +1588,46 @@ def cmd_request(config):
                 except json.JSONDecodeError:
                     continue
 
-                if msg.get("id") == lsp_request["id"]:
-                    sock.close()
-                    result = parse_lsp_response(method, msg, max_results)
-                    print(json.dumps(result, ensure_ascii=False))
-                    return
+                slot = pending_ids.pop(msg.get("id"), None)
+                if slot is None:
+                    continue  # unknown ID, ignore
+                _, method, max_results, _ = built[slot]
+                results[slot] = parse_lsp_response(method, msg, max_results)
 
-        sock.close()
-        result = {"error": "Timeout waiting for LSP response"}
+        # Anything still pending = timed out.
+        for lsp_id, slot in pending_ids.items():
+            results[slot] = {"error": "Timeout waiting for LSP response"}
 
     except Exception as e:
-        result = {"error": f"LSP request failed: {e}"}
+        # Fill any unset slots with the connection error.
+        err = {"error": f"LSP batch failed: {e}"}
+        for i in range(len(results)):
+            if results[i] is None:
+                results[i] = err
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
 
-    print(json.dumps(result, ensure_ascii=False))
+    print(json.dumps(results, ensure_ascii=False))
 
 
 # ── Main ──────────────────────────────────────────────────────────────
 
 
 def print_usage():
-    print("Usage: lsp-runner {start|stop|status|language|request}")
+    print("Usage: lsp-runner {start|stop|status|language|request|batch}")
     print()
     print("Commands:")
     print("  start     Auto-detect language and start LSP server")
     print("  stop      Stop the LSP server")
     print("  status    Show server status")
     print("  language  Print detected language")
-    print("  request   Accept JSON via stdin and return LSP result")
+    print("  request   Accept ONE JSON request via stdin and return result")
+    print("  batch     Accept a JSON ARRAY of requests via stdin and return")
+    print("            results in the same order, pipelined over one socket")
     print()
     print("Request format (stdin):")
     print(
@@ -1269,6 +1661,8 @@ def main():
         cmd_language(config)
     elif command == "request":
         cmd_request(config)
+    elif command == "batch":
+        cmd_batch(config)
     else:
         print(f"Unknown command: {command}")
         print_usage()
